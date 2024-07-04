@@ -1,3 +1,219 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:f04b288dccf41178369f25e69efbdcf2caa99c2639340f7eb80f7010691aa2d7
-size 10119
+---
+title: "Space Use and Risk Responses in Foraging Common Ravens - Code"
+output: html_document
+date: "2024-06-14"
+---
+
+#### 1. Presence Data 
+
+Daily probability of presence at different feeding enclosures in the wildpark.
+
+```{r Load packages}
+
+library(sp)
+library(terra)
+library(move)
+library(lubridate)
+library(dplyr)
+library(sf)
+library(tidyr)
+library(chron)
+library(ggplot2)
+library(reshape)
+library(plyr)
+```
+
+```{r Read in data from Movebank and assign timestamps}
+
+# Input Movebank login details
+login <- movebankLogin()
+
+# Source data from GPS-tagged ravens - timestamp requires 9 zeroes following date
+ravens <- getMovebankData(study="Common Ravens in the Eastern Alps",
+                          login=login,
+                          timestamp_start = "20200101000000000", 
+                          timestamp_end = "20240531000000000",
+                          removeDuplicatedTimestamps=TRUE) # Ignore warning
+
+# Assign the correct time zone (accounts for daylight savings)
+timestamps(ravens) <- with_tz(timestamps(ravens), tz="Europe/Vienna")
+
+# Check the timezone
+head(timestamps(ravens))
+
+# Check individuals
+levels(ravens@trackId)
+
+# Convert move object to dataframe
+ravens_df <- as(ravens, "data.frame")
+```
+
+```{r Filter to only include daytime points}
+
+# Create a dataframe with timestamps and location for 'suncalc' package
+sun <- data.frame(date= as.Date(ravens_df$timestamps, tz = "Europe/Vienna"), 
+                  lat=ravens_df$location_lat, lon=ravens_df$location_long)
+
+# Install/load 'suncalc' package
+devtools::install_github("datastorm-open/suncalc")
+require(suncalc)
+
+# Calculate sunrise and sunset times
+sunrise <-getSunlightTimes(data=sun, keep="sunrise", tz = "Europe/Vienna") 
+sunset <- getSunlightTimes(data=sun, keep="sunsetStart", tz = "Europe/Vienna") 
+
+# Create a new column for the move object, where fixes that have timestamps
+# before sunrise and after sunset (i.e., night) should be marked as 1, else 0
+ravens_df$night_day <- ifelse(ravens_df$timestamps < sunrise$sunrise | 
+                                ravens_df$timestamps > sunset$sunset,
+                              night <- 1, night <- 0)
+
+# Proportion of night relative to daytime points by month
+ravens_df %>% 
+  mutate(month = format(as.Date(timestamps), "%m")) %>%
+  ggplot(aes(month))+geom_bar(aes(fill = as.factor(night_day)), position = "fill")
+
+# Filter to include only GPS points recorded during the day
+ravens_day <- ravens_df %>% filter(night_day == 0)
+
+# Filter columns needed
+head(ravens_day)
+ravens_filter <- ravens_day[,c("location_lat",
+                               "location_long",
+                               "timestamps",
+                               "local_identifier")]
+
+# Check to see if timestamps are still in local time
+head(ravens_filter$timestamps)
+
+# Create a column with the date 
+ravens_filter$date <- as.Date(ravens_filter$timestamps, tz = "Europe/Vienna")
+
+# Create a column with the time 
+ravens_filter$time <- format(ravens_filter$timestamps, format = "%H:%M:%S")
+
+# Local identifier as factor
+class(ravens_filter$local_identifier)
+ravens_filter$local_identifier <- as.factor(ravens_filter$local_identifier)
+```
+
+```{r Filter data to only include points four months post-release}
+
+# Define release dates
+release_dates <- as.Date(c("2017-10-10", "2018-09-04",
+                           "2019-08-30", "2020-09-03", "2021-09-06",
+                           "2022-09-09"), format="%Y-%m-%d")
+
+dates <- as.data.frame(release_dates)
+dates$release_dates <- as.Date(dates$release_dates, format = "%Y-%m-%d")
+dates$month_release <- release_dates + 122 #four months post-release
+
+
+# Filter raven movement data to include only points taken four months post-release
+ravens_month <- ravens_filter %>% subset(date >= dates$release_dates & 
+                                           date < dates$month_release)
+
+# Add release date column to data
+ravens_month$release_date <- 
+  ifelse(ravens_month$date >= dates$release_dates[1] & 
+           ravens_month$date < dates$month_release[1], paste0(dates$release_dates[1]),
+         ifelse(ravens_month$date >= dates$release_dates[2] & 
+                  ravens_month$date < dates$month_release[2], paste0(dates$release_dates[2]),
+                ifelse(ravens_month$date >= dates$release_dates[3] & 
+                         ravens_month$date < dates$month_release[3], paste0(dates$release_dates[3]),
+                       ifelse(ravens_month$date >= dates$release_dates[4] & 
+                                ravens_month$date < dates$month_release[4], paste0(dates$release_dates[4]),
+                              ifelse(ravens_month$date >= dates$release_dates[5] & 
+                                       ravens_month$date < dates$month_release[5], paste0(dates$release_dates[5]),
+                                     paste0(dates$release_dates[6]))))))
+
+# Nest by release date 
+ravens_month_nested <- ravens_month %>% nest(data = -c(release_date))
+
+# Group data into biweekly intervals from the release date
+ravens_biweek <- list()
+
+for (i in 1:nrow(ravens_month_nested)){
+  ravens_biweek[[i]] <- ravens_month_nested$data[[i]] %>%
+    mutate(week = cut(date, breaks=seq.Date(min(date), 
+                                            max(date)+14,
+                                            by = 14)))
+}
+
+ravens_biweek_df <- do.call(rbind.data.frame, ravens_biweek)
+
+# Check the biweekly intervals
+levels(ravens_biweek_df$week)
+```
+
+```{r Calculate intersections with boar and wolf enclosures}
+
+# Convert raven data into Austria Lambert projection
+range(ravens_biweek_df$location_long)
+ravens_coords <- ravens_biweek_df
+
+coordinates(ravens_coords) <-  c("location_long", "location_lat")
+proj4string(ravens_coords) <- CRS("+proj=longlat +datum=WGS84")
+ravens_proj <- spTransform(ravens_coords, CRS("EPSG:3416"))
+# For more info see https://epsg.io/3416 
+
+# Convert raven data (Lambert projection) into an sf object
+presence_sf <- st_as_sf(x = ravens_proj, 
+                        coords = c("location_long", "location_lat"),
+                        crs = "EPSG:3416")
+
+# Read in the coordinates for the park locations of interest
+park_coords <- read.csv("FI_GPS coordinates.csv")
+
+# Convert enclosure coordinates into Lambert projection
+coordinates(park_coords) <- c("Longitude", "Latitute")
+proj4string(park_coords) <- CRS("+proj=longlat +datum=WGS84")
+park_coords_utm <- spTransform(park_coords, CRS("EPSG:3416"))
+park_coords_utm <- as.data.frame(park_coords_utm)
+head(park_coords_utm)
+
+# Convert enclosure locations (Lambert projection) into an sf object
+park_sf <- st_as_sf(x = park_coords_utm, 
+                    coords = c("coords.x1", "coords.x2"),
+                    crs = "EPSG:3416")
+head(park_sf)
+
+# Get the geometry of location values
+geom_locs = st_geometry(park_sf, CRS("EPSG:3416"))
+head(geom_locs)
+
+# Checking the projections
+projection(presence_sf)
+projection(park_sf)
+projection(geom_locs)
+
+# Set buffers
+park_buf <- st_buffer(geom_locs, dist = 100) # 'dist' is in meters, setting a buffer for 100m
+
+# For each GPS fix, calculate whether or not it intersects with any of the buffers
+# If it does not intersect, in the intersection column, paste " ", else "AFS"
+presence_sf <- st_set_crs(presence_sf, "EPSG:3416")
+
+projection(presence_sf)
+projection(park_buf)
+class(presence_sf$geometry)
+
+intersect_dat <- presence_sf %>% mutate(
+  intersection = as.character(st_intersects(geometry, park_buf)),
+  intersect = as.numeric(intersection),
+  location = if_else(is.na(intersect), "0", paste0("1"))) 
+  
+intersect_df <- as.data.frame(intersect_dat)
+levels(as.factor(intersect_df$intersect))
+
+# Merge intersection data with raven data
+presence_intersect <- merge.data.frame(intersect_df, ravens_filter, 
+                                       by = c("local_identifier", "timestamps", "date","time"))
+
+
+presence_intersect$intersect <- as.factor(presence_intersect$intersect)
+presence_intersect$intersect <- revalue(presence_intersect$intersect, c("1" = "wolf",
+                                                                        "2" = "wild boar",
+                                                                        "3" = "deer"))
+head(presence_intersect)
+```
