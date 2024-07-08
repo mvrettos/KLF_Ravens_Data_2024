@@ -4,23 +4,50 @@ output: html_document
 date: "2024-06-14"
 ---
 
-#### 1. Presence Data 
+#### 1. Prepare Feeding Data
 
-Daily probability of presence at different feeding enclosures in the wildpark.
+```{r Load packages}
+library(dplyr)
+library(stringr)
+```
+
+```{r Read in boar feeding data}
+boars_original <- read.csv("Boar Feeding Data 2020-2024.csv")
+head(boars_original)
+```
+
+```{r Select only relevant rows and columns}
+
+# Remove all boar feeding days for which the food given contained pellets or scraps only (low quality food), and for which the food given contained entrails or cheese (high quality food). Also remove all with potential confounding factors (carcass at wolves/bears, predator playback, culling, novel person/object, etc.)
+boars_filter <- boars_original %>%
+  filter(str_detect(Food.Type, 'Bread')) %>%
+  filter(!str_detect(Food.Type, 'entrails|cheese')) %>%
+  filter(!str_detect(Predator.Alarm.Call.Playback, '1'))  %>%
+  filter(!str_detect(Food.at.Wolf.Bear.Enclosure, '1')) %>%
+  filter(!str_detect(Novel.Person.Object, '1')) %>%
+  filter(!str_detect(Hunting.Culling.Construction.Work, '1'))
+
+# Remove columns not necessary for recursions
+boars <- boars_filter %>%
+  dplyr::select(Date = Date, Year = Year, Month = Month, Day = Day, 
+                Food_Buckets = X..Food.Buckets)
+```
+
+#### 2. Prepare GPS Data
 
 ```{r Load packages}
 
+library(chron)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(move)
+library(plyr)
+library(reshape)
+library(sf)
 library(sp)
 library(terra)
-library(move)
-library(lubridate)
-library(dplyr)
-library(sf)
 library(tidyr)
-library(chron)
-library(ggplot2)
-library(reshape)
-library(plyr)
 ```
 
 ```{r Read in data from Movebank and assign timestamps}
@@ -29,30 +56,30 @@ library(plyr)
 login <- movebankLogin()
 
 # Source data from GPS-tagged ravens - timestamp requires 9 zeroes following date
-ravens <- getMovebankData(study="Common Ravens in the Eastern Alps",
+ravens_original <- getMovebankData(study="Common Ravens in the Eastern Alps",
                           login=login,
                           timestamp_start = "20200101000000000", 
                           timestamp_end = "20240531000000000",
                           removeDuplicatedTimestamps=TRUE) # Ignore warning
 
 # Assign the correct time zone (accounts for daylight savings)
-timestamps(ravens) <- with_tz(timestamps(ravens), tz="Europe/Vienna")
+timestamps(ravens_original) <- with_tz(timestamps(ravens_original), tz="Europe/Vienna")
 
 # Check the timezone
-head(timestamps(ravens))
+head(timestamps(ravens_original))
 
 # Check individuals
-levels(ravens@trackId)
+levels(ravens_original@trackId)
 
 # Convert move object to dataframe
-ravens_df <- as(ravens, "data.frame")
+ravens_original_df <- as(ravens_original, "data.frame")
 ```
 
 ```{r Filter to only include daytime points}
 
 # Create a dataframe with timestamps and location for 'suncalc' package
-sun <- data.frame(date= as.Date(ravens_df$timestamps, tz = "Europe/Vienna"), 
-                  lat=ravens_df$location_lat, lon=ravens_df$location_long)
+sun <- data.frame(date= as.Date(ravens_original_df$timestamps, tz = "Europe/Vienna"), 
+                  lat=ravens_original_df$location_lat, lon=ravens_original_df$location_long)
 
 # Install/load 'suncalc' package
 devtools::install_github("datastorm-open/suncalc")
@@ -64,95 +91,60 @@ sunset <- getSunlightTimes(data=sun, keep="sunsetStart", tz = "Europe/Vienna")
 
 # Create a new column for the move object, where fixes that have timestamps
 # before sunrise and after sunset (i.e., night) should be marked as 1, else 0
-ravens_df$night_day <- ifelse(ravens_df$timestamps < sunrise$sunrise | 
-                                ravens_df$timestamps > sunset$sunset,
+ravens_original_df$night_day <- ifelse(ravens_original_df$timestamps < sunrise$sunrise | 
+                                ravens_original_df$timestamps > sunset$sunset,
                               night <- 1, night <- 0)
 
 # Proportion of night relative to daytime points by month
-ravens_df %>% 
+ravens_original_df %>% 
   mutate(month = format(as.Date(timestamps), "%m")) %>%
   ggplot(aes(month))+geom_bar(aes(fill = as.factor(night_day)), position = "fill")
 
 # Filter to include only GPS points recorded during the day
-ravens_day <- ravens_df %>% filter(night_day == 0)
+ravens_day <- ravens_original_df %>% filter(night_day == 0)
 
 # Filter columns needed
 head(ravens_day)
-ravens_filter <- ravens_day[,c("location_lat",
-                               "location_long",
-                               "timestamps",
-                               "local_identifier")]
+ravens_day_filter <- ravens_day %>%
+  dplyr::select(Latitude = location_lat, Longitude = location_long, Timestamps = timestamps, Local_Identifier = local_identifier)
 
 # Check to see if timestamps are still in local time
-head(ravens_filter$timestamps)
+head(ravens_day_filter$Timestamps)
 
 # Create a column with the date 
-ravens_filter$date <- as.Date(ravens_filter$timestamps, tz = "Europe/Vienna")
+ravens_day_filter$Date <- as.Date(ravens_day_filter$Timestamps, tz = "Europe/Vienna")
 
 # Create a column with the time 
-ravens_filter$time <- format(ravens_filter$timestamps, format = "%H:%M:%S")
+ravens_day_filter$Time <- format(ravens_day_filter$Timestamps, format = "%H:%M:%S")
 
 # Local identifier as factor
-class(ravens_filter$local_identifier)
-ravens_filter$local_identifier <- as.factor(ravens_filter$local_identifier)
+class(ravens_day_filter$Local_Identifier)
+ravens_day_filter$Local_Identifier <- as.factor(ravens_day_filter$Local_Identifier)
+
+# Convert to data frame
+ravens_day_filter_df <- as(ravens_day_filter, "data.frame")
+```
+```{r Filter to only include dates for which there are boar/wolf feeding data}
+
+# Convert the date information in the boar and wolf feeding data
+boars$Date <- as.Date(boars$Date, tz = "Europe/Vienna")
+
+# Filter GPS data to only include the dates for which there are boar feeding data. As the wolf feeding data contain the same list of dates, it does not matter which is specified here.
+ravens_filter_df <- ravens_day_filter_df %>%
+              filter(Date %in% boars$Date)
 ```
 
-```{r Filter data to only include points four months post-release}
-
-# Define release dates
-release_dates <- as.Date(c("2017-10-10", "2018-09-04",
-                           "2019-08-30", "2020-09-03", "2021-09-06",
-                           "2022-09-09"), format="%Y-%m-%d")
-
-dates <- as.data.frame(release_dates)
-dates$release_dates <- as.Date(dates$release_dates, format = "%Y-%m-%d")
-dates$month_release <- release_dates + 122 #four months post-release
-
-
-# Filter raven movement data to include only points taken four months post-release
-ravens_month <- ravens_filter %>% subset(date >= dates$release_dates & 
-                                           date < dates$month_release)
-
-# Add release date column to data
-ravens_month$release_date <- 
-  ifelse(ravens_month$date >= dates$release_dates[1] & 
-           ravens_month$date < dates$month_release[1], paste0(dates$release_dates[1]),
-         ifelse(ravens_month$date >= dates$release_dates[2] & 
-                  ravens_month$date < dates$month_release[2], paste0(dates$release_dates[2]),
-                ifelse(ravens_month$date >= dates$release_dates[3] & 
-                         ravens_month$date < dates$month_release[3], paste0(dates$release_dates[3]),
-                       ifelse(ravens_month$date >= dates$release_dates[4] & 
-                                ravens_month$date < dates$month_release[4], paste0(dates$release_dates[4]),
-                              ifelse(ravens_month$date >= dates$release_dates[5] & 
-                                       ravens_month$date < dates$month_release[5], paste0(dates$release_dates[5]),
-                                     paste0(dates$release_dates[6]))))))
-
-# Nest by release date 
-ravens_month_nested <- ravens_month %>% nest(data = -c(release_date))
-
-# Group data into biweekly intervals from the release date
-ravens_biweek <- list()
-
-for (i in 1:nrow(ravens_month_nested)){
-  ravens_biweek[[i]] <- ravens_month_nested$data[[i]] %>%
-    mutate(week = cut(date, breaks=seq.Date(min(date), 
-                                            max(date)+14,
-                                            by = 14)))
-}
-
-ravens_biweek_df <- do.call(rbind.data.frame, ravens_biweek)
-
-# Check the biweekly intervals
-levels(ravens_biweek_df$week)
-```
+#### 3. Intersections
 
 ```{r Calculate intersections with boar and wolf enclosures}
 
-# Convert raven data into Austria Lambert projection
-range(ravens_biweek_df$location_long)
-ravens_coords <- ravens_biweek_df
+### Intersections and recursions are based on GPS points representing centre points of the enclosures for now; will change these to polygons of the enclosures and/or coordinates of the specific feeding locations.
 
-coordinates(ravens_coords) <-  c("location_long", "location_lat")
+# Convert raven data into Austria Lambert projection
+range(ravens_filter_df$Longitude)
+ravens_coords <- ravens_filter_df
+
+coordinates(ravens_coords) <-  c("Longitude", "Latitude")
 proj4string(ravens_coords) <- CRS("+proj=longlat +datum=WGS84")
 ravens_proj <- spTransform(ravens_coords, CRS("EPSG:3416"))
 # For more info see https://epsg.io/3416 
@@ -162,11 +154,11 @@ presence_sf <- st_as_sf(x = ravens_proj,
                         coords = c("location_long", "location_lat"),
                         crs = "EPSG:3416")
 
-# Read in the coordinates for the park locations of interest
-park_coords <- read.csv("FI_GPS coordinates.csv")
+# Read in the coordinates for the feeding enclosures
+park_coords <- read.csv("FI_GPS coordinates.csv") ### Change these to polygons of the enclosures or coordinates of the feeding cages
 
 # Convert enclosure coordinates into Lambert projection
-coordinates(park_coords) <- c("Longitude", "Latitute")
+coordinates(park_coords) <- c("Longitude", "Latitude")
 proj4string(park_coords) <- CRS("+proj=longlat +datum=WGS84")
 park_coords_utm <- spTransform(park_coords, CRS("EPSG:3416"))
 park_coords_utm <- as.data.frame(park_coords_utm)
@@ -188,18 +180,18 @@ projection(park_sf)
 projection(geom_locs)
 
 # Set buffers
-park_buf <- st_buffer(geom_locs, dist = 100) # 'dist' is in meters, setting a buffer for 100m
+park_buffer <- st_buffer(geom_locs, dist = 50) # 'dist' is in meters, setting a buffer for 50m
 
 # For each GPS fix, calculate whether or not it intersects with any of the buffers
-# If it does not intersect, in the intersection column, paste " ", else "AFS"
+# If it does not intersect, in the intersection column, paste " ", else "Enclosure"
 presence_sf <- st_set_crs(presence_sf, "EPSG:3416")
 
 projection(presence_sf)
-projection(park_buf)
+projection(park_buffer)
 class(presence_sf$geometry)
 
 intersect_dat <- presence_sf %>% mutate(
-  intersection = as.character(st_intersects(geometry, park_buf)),
+  intersection = as.character(st_intersects(geometry, park_buffer)),
   intersect = as.numeric(intersection),
   location = if_else(is.na(intersect), "0", paste0("1"))) 
   
@@ -207,13 +199,355 @@ intersect_df <- as.data.frame(intersect_dat)
 levels(as.factor(intersect_df$intersect))
 
 # Merge intersection data with raven data
-presence_intersect <- merge.data.frame(intersect_df, ravens_filter, 
-                                       by = c("local_identifier", "timestamps", "date","time"))
-
+presence_intersect <- merge.data.frame(intersect_df, ravens_filter_df, 
+                                       by = c("Local_Identifier", "Timestamps", "Date","Time"))
 
 presence_intersect$intersect <- as.factor(presence_intersect$intersect)
-presence_intersect$intersect <- revalue(presence_intersect$intersect, c("1" = "wolf",
-                                                                        "2" = "wild boar",
-                                                                        "3" = "deer"))
+presence_intersect$intersect <- revalue(presence_intersect$intersect, c("1" = "Wolf",
+                                                                        "2" = "Wild boar"))
 head(presence_intersect)
+```
+
+#### 4. Recursions
+
+```{r Load packages}
+library(cluster)
+library(dplyr)
+library(ggplot2)
+library(ggmap)
+library(lubridate)
+library(move)
+library(plyr)
+library(raster)
+library(recurse)
+library(reshape2)
+library(RgoogleMaps)
+library(rworldmap)
+library(scales)
+library(viridis)
+```
+
+```{r Prepare raven data}
+
+### Intersections and recursions are based on GPS points representing centre points of the enclosures for now; will change these to polygons of the enclosures and/or coordinates of the specific feeding locations.
+
+# Make sure that timestamps are in the correct time zone
+head(ravens_filter_df$Timestamps)
+ravens_filter_df$timestamps <- ymd_hms(ravens_filter_df$Timestamps, tz="Europe/Vienna")
+
+# Make sure that coordinates are in the correct projection (Lambert)
+ravens_filter_coords <- ravens_filter_df %>%
+  dplyr::select(Latitude = Latitude, Longitude = Longitude, Timestamps = Timestamps, Local_Identifier = Local_Identifier)
+coordinates(ravens_filter_coords) <- c("Longitude", "Latitude")
+proj4string(ravens_filter_coords) <- CRS("+proj=longlat +datum=WGS84")
+
+# Convert to a spatial object
+ravens_UTM <- spTransform(ravens_filter_coords, CRS("+proj=utm +zone=33 ellps=WGS84"))
+ravens_UTM <- as.data.frame(ravens_UTM)
+ravens_UTM <- ravens_UTM[c(3,4,1,2)]
+head(ravens_UTM)
+
+# Read in location data 
+locs <- read.csv("FI_GPS coordinates.csv") ### Change these to polygons of the enclosures or coordinates of the feeding cages
+
+# Convert location data into UTM projection
+locs_coords <- locs %>%
+  dplyr::select(Latitude = Latitude, Longitude = Longitude, Location = Location)
+coordinates(locs_coords) <- c("Longitude", "Latitude")
+proj4string(locs_coords) <- CRS("+proj=longlat +datum=WGS84")
+locs_UTM <- spTransform(locs_coords, CRS("+proj=utm +zone=33 ellps=WGS84"))
+
+# Convert back to data frame 
+locs_UTM <- as.data.frame(locs_UTM)
+head(locs_UTM)
+
+# save(list = ls(all = T), file = 'recurse.RData')
+```
+
+```{r Calculate recursions}
+
+# Prepare location data
+locs_UTM <- droplevels(locs_UTM)
+locs_UTM <- split(locs_UTM, locs_UTM$Location)
+
+enclosures <- rapply(locs_UTM, length, how = "list")
+enclosure_stats <- rapply(locs_UTM, length, how = "list")
+
+# Recursions
+for( i in (1:length(locs_UTM))){
+  enclosures[[i]] <- getRecursionsAtLocations(
+    ravens_UTM,
+    locs_UTM[[i]][2:3], # Selecting just for lat and long columns
+    radius = 80, # Select radii
+    threshold = 0, # A time difference (in units timeunits) to ignore excursions outside the radius
+    timeunits = c("hours"),
+    verbose = TRUE
+  )
+  enclosure_stats[[i]] <- enclosures[[i]]$revisitStats # Creates a df with the revisit stats
+}
+
+# for( i in (1:length(locs_UTM))){
+# enclosures[[i]] <- getRecursionsInPolygon(
+#  ravens_UTM,
+#  polygon,
+#  threshold = 0, # A time difference (in units timeunits) to ignore excursions outside the radius
+#  timeunits = c("hours"),
+#  verbose = TRUE
+# )
+# enclosure_stats[[i]] <- enclosures[[i]]$revisitStats # Creates a df with the revisit stats
+# }
+
+# write.csv(enclosure_stats, "Revisits.csv")
+```
+
+```{r Calculate revisits}
+
+# Split revisits data frame into separate data frames for the wolf and boar enclosures
+revisits_df_boars <- enclosure_stats[[1]]
+revisits_df_wolves <- enclosure_stats[[2]]
+
+# Add columns specifying the feeding enclosure
+boars_id <- rep(c("Wild boar"), times = nrow(revisits_df_boars))
+revisits_df_boars$enclosure <- boars_id
+wolves_id <- rep(c("Wolf"), times = nrow(revisits_df_wolves))
+revisits_df_wolves$enclosure <- wolves_id
+
+# Combine into a single dataframe
+revisits_df <- rbind(revisits_df_boars, revisits_df_wolves)
+
+# Calculate entrance and exit times
+revisits_df$entranceTime <- ymd_hms(revisits_df$entranceTime, tz="Europe/Vienna")
+revisits_df$exitTime <- ymd_hms(revisits_df$exitTime, tz="Europe/Vienna")
+head(revisits_df)
+
+# Filter to exclude all revisits outside of feeding times - morning (7-10 am) for boars, late afternoon (3-6 pm) for wolves
+revisits_df_boars_1 <- revisits_df %>%
+  filter(str_detect(enclosure, 'Wild boar'))
+revisits_df_wolves_1 <- revisits_df %>%
+  filter(str_detect(enclosure, 'Wolf'))
+
+revisits_df_boars_1 <- as_tibble(revisits_df_boars_1)
+revisits_df_boars_filter <- revisits_df_boars_1 %>%  
+                  mutate(timestamp_enter = ymd_hms(entranceTime, tz = 'Europe/Vienna'),
+                         timestamp_est = with_tz(timestamp_enter, 'Europe/Vienna'),
+                         time_est = hms::as_hms(timestamp_est)) %>% 
+  filter(time_est >= hms::as.hms('07:00:00'),
+         time_est <= hms::as.hms('09:59:59'))
+
+revisits_df_wolves_1 <- as_tibble(revisits_df_wolves_1)
+revisits_df_wolves_filter <- revisits_df_wolves_1 %>%  
+                  mutate(timestamp_enter = ymd_hms(entranceTime, tz = 'Europe/Vienna'),
+                         timestamp_est = with_tz(timestamp_enter, 'Europe/Vienna'),
+                         time_est = hms::as_hms(timestamp_est)) %>% 
+  filter(time_est >= hms::as.hms('15:00:00'),
+         time_est <= hms::as.hms('17:59:59'))
+
+revisits_df <- rbind(revisits_df_boars_filter, revisits_df_wolves_filter)
+revisits_df <- revisits_df %>%
+  dplyr::select(id = id, x = x, y = y, coordIdx = coordIdx, visitIdx = visitIdx, entranceTime = entranceTime, exitTime = exitTime, timeInside = timeInside, timeSinceLastVist = timeSinceLastVisit, enclosure = enclosure)
+
+# To exclude very short duration visits - what is a short duration for the ravens?
+# revisits_df = revisits_df[revisits_df$timeInside > 0.1,]
+
+# Extract year when feeding enclosure was visited
+revisits_df$year = year(revisits_df$entranceTime)
+
+# Extract day of year when feeding enclosure was visited 
+revisits_df$doy_enter = yday(revisits_df$entranceTime) # yday returns the day of the year as a decimal number (01-366)
+
+# Extract month when feeding enclosure was visited
+revisits_df$month = month(revisits_df$entranceTime)
+months <- c("Jan","Feb","Mar",
+              "Apr","May","Jun",
+              "Jul","Aug","Sep",
+              "Oct","Nov","Dec")
+revisits_df$monthAbb <- months[ revisits_df$month ]
+
+# Extract day of month when feeding enclosure was visited 
+revisits_df$dom_enter = mday(revisits_df$entranceTime) # mday returns the day of the month as a decimal number (01-31)
+
+# Extract hour when feeding enclosure was entered
+revisits_df$hour_enter = hour(revisits_df$entranceTime)
+ 
+# Entrance time and exit time
+revisits_df$time_enter = hour(revisits_df$entranceTime) + minute(revisits_df$entranceTime) / 60 + second(revisits_df$entranceTime) / 60 / 60
+revisits_df$time_exit = hour(revisits_df$exitTime) + minute(revisits_df$exitTime) / 60 + second(revisits_df$exitTime) / 60 / 60
+
+# Overnight or not
+# enclosure_stats$overnight = factor(as.logical(yday(enclosure_stats$exitTime) - yday(enclosure_stats$entranceTime)))
+#levels(enclosure_stats$overnight) = c("no", "yes")
+```
+
+```{r Revisit summaries}
+
+# Split up revisits into seasons
+revisits_df$year_season <- ifelse(revisits_df$entranceTime < "2020-03-21 00:00:00", "win0",
+                                                 ifelse (revisits_df$entranceTime >= "2020-03-21 00:00:00" & revisits_df$entranceTime < "2020-06-21 00:00:00" , "spr1",
+                                                 ifelse (revisits_df$entranceTime >= "2020-06-21 00:00:00" & revisits_df$entranceTime < "2020-09-23 00:00:00" , "sum1",
+                                                 ifelse (revisits_df$entranceTime >= "2020-09-23 00:00:00" & revisits_df$entranceTime < "2020-12-21 00:00:00" , "aut1",
+                                                 ifelse (revisits_df$entranceTime >= "2020-12-21 00:00:00" & revisits_df$entranceTime < "2021-03-21 00:00:00" , "win1",
+                                                 ifelse (revisits_df$entranceTime >= "2021-03-21 00:00:00" & revisits_df$entranceTime < "2021-06-21 00:00:00" , "spr2",
+                                                 ifelse (revisits_df$entranceTime >= "2021-06-21 00:00:00" & revisits_df$entranceTime < "2021-09-23 00:00:00" , "sum2",
+                                                 ifelse (revisits_df$entranceTime >= "2021-09-23 00:00:00" & revisits_df$entranceTime < "2021-12-21 00:00:00" , "aut2",
+                                                 ifelse (revisits_df$entranceTime >= "2021-12-21 00:00:00" & revisits_df$entranceTime < "2022-03-21 00:00:00" , "win2",
+                                                 ifelse (revisits_df$entranceTime >= "2022-03-21 00:00:00" & revisits_df$entranceTime < "2022-06-21 00:00:00" , "spr3",
+                                                 ifelse (revisits_df$entranceTime >= "2022-06-21 00:00:00" & revisits_df$entranceTime < "2022-09-23 00:00:00" , "sum3", 
+                                                 ifelse (revisits_df$entranceTime >= "2022-09-23 00:00:00" & revisits_df$entranceTime < "2022-12-21 00:00:00" , "aut3",
+                                                 ifelse (revisits_df$entranceTime >= "2022-12-21 00:00:00" & revisits_df$entranceTime < "2023-03-21 00:00:00" , "win3",                                                                                                         ifelse (revisits_df$entranceTime >= "2023-03-21 00:00:00" & revisits_df$entranceTime < "2023-06-21 00:00:00" , "spr4",
+                                                 ifelse (revisits_df$entranceTime >= "2023-06-21 00:00:00" & revisits_df$entranceTime < "2023-09-23 00:00:00" , "sum4", 
+                                                 ifelse (revisits_df$entranceTime >= "2023-09-23 00:00:00" & revisits_df$entranceTime < "2023-12-21 00:00:00" , "aut4",
+                                                 ifelse (revisits_df$entranceTime >= "2023-12-21 00:00:00" & revisits_df$entranceTime < "2024-03-21 00:00:00" , "win4",     
+                                                 ifelse (revisits_df$entranceTime >= "2024-03-21 00:00:00" & revisits_df$entranceTime < "2024-06-21 00:00:00" , "spr5", 0))))))))))))))))))
+### Using same date ranges for seasons - change these?
+
+# Calculate the number of feeding enclosure visits by each individual per season
+revisits_ind <- revisits_df %>% group_by(year_season, id, enclosure) %>% tally()
+
+# write.csv(revisits_ind, "Individual revisits.csv")
+
+# Calculate the average time spent inside each feeding enclosure by each individual per season
+timein_ind <- aggregate(timeInside ~ year_season + id + enclosure, data = revisits_df, mean)
+timeexit_ind <- aggregate(time_exit ~ year_season + id + enclosure, data = revisits_df, mean)
+timeenter_ind <-aggregate(time_enter ~ year_season + id + enclosure, data = revisits_df, mean)
+time_ind <- merge(timein_ind, timeexit_ind) %>%
+  merge(timeenter_ind)
+
+revisits_sites <- merge.data.frame(revisits_ind, time_ind, by.x = c("id","year_season", "enclosure"),by.y = c("id", "year_season", "enclosure"),
+                           all.x = TRUE, sort = TRUE)
+
+# write.csv(revisits_sites, "Time spent inside feeding enclosures.csv")
+
+# Total number of individuals at each feeding enclosure per season and year/ overall - ?
+# ind_enclosures <- aggregate(id ~ year_season + enclosure, data = revisits_df, count)
+# listx <- as.data.frame(ind_enclosures$id)
+# ind_enclosures_table <- as.data.frame(ind_enclosures)
+# ind_enclosures_matrix <- dcast(ind_enclosures_table, enclosure ~ year_season)
+
+# Number of revisits for each location (as a total across all individuals) per season and year / overall
+revisit_all <- revisits_df %>% group_by(year_season, enclosure) %>% tally()
+
+# Average time spent in each feeding enclosure (as a total across all individuals) 
+timein_all <- aggregate(timeInside ~ year_season + enclosure, data = revisits_df, mean)
+timeexit_all <- aggregate(time_exit ~ year_season + enclosure, data = revisits_df, mean)
+timeenter_all <-aggregate(time_enter ~ year_season + enclosure, data = revisits_df, mean)
+time_all <- merge(timein_all, timeexit_all) %>%
+  merge(timeenter_all)
+```
+
+#### Plots - ignore for now
+
+```{r Plots}
+ggplot(ind_afs_table, aes(x = site, y = no_ind, col = season)) + 
+  geom_point()+
+  xlab("Foraging site") + ylab("number of individuals") + 
+  theme_classic()+
+  theme(axis.text.x=element_text(angle = 90, vjust = 0.5))
+
+ggplot(time_afs, aes(x = column_label, y = timeInside, col = season)) + 
+  geom_point()+
+  xlab("Foraging site") + ylab("mean time inside in hrs") + 
+  theme_classic()+
+  theme(axis.text.x=element_text(angle = 90, vjust = 0.5))
+
+ggplot(revisit.df, aes(x=column_label, y = timeInside, fill = season)) + 
+  geom_boxplot()+
+  xlab("month") + ylab("time spent inside") + 
+  theme_classic()+
+  coord_cartesian(ylim= c(0,2))+
+  theme(axis.text.x=element_text(angle = 90, vjust = 0.5))
+
+
+#Plotting the revisitation frequency for individuals (per month) for each yr & site
+sites <- subset(revisit.df, column_label == c("Foraging1", "Foraging2", "Foraging3", "Foraging4"))
+sites <- droplevels(sites)
+ggplot(sites, aes(x=monthAbb, y = timeInside)) + 
+  geom_boxplot()+
+  facet_grid(column_label ~ year, scales = "free") + 
+  xlab("month") + ylab("time spent inside") + 
+  theme_classic()
+ 
+
+
+# plot entrance time by year and month
+ttime = ggplot(wp.stats, aes(x = monthAbb)) + 
+  geom_bar(stat = "count", color = "darkgray", fill = "gray") +
+  facet_grid(site ~ year) + 
+  xlab("visit day of month") + ylab("revisit frequency") + 
+  theme_classic()
+ttime 
+
+
+
+# visit duration by entrance time of day
+binhour = ggplot(wp.stats, aes(x = time_enter, y = timeInside)) +
+  geom_density2d(color = "black") + ylim(0, 24) + 
+  scale_color_brewer(palette = "Dark2", name = 'overnight') +
+  xlab("visit entrance time") + ylab("visit duration (h)") +
+  geom_point(alpha = 0.2, aes(col = overnight)) +
+  theme_classic() + theme(
+    axis.line.x = element_line(colour = 'black', size = 0.5, linetype = 'solid'),
+    axis.line.y = element_line(colour = 'black', size = 0.5, linetype = 'solid'),
+    legend.justification = c(0, 1), legend.position = c(0, 1))
+binhour
+
+# does visit duration vary through breeding season?
+
+library(RColorBrewer)
+
+colourCount = length(unique(wp.stats$id))
+getPalette = colorRampPalette(brewer.pal(9, "Set1"))
+
+bindoy = ggplot(wp.stats, aes(x = month, y = timeInside)) +
+  geom_density2d(color = "black") + ylim(0, 24) + 
+  scale_fill_manual(values = getPalette(colourCount), name = 'individual') +
+  xlab("visit entrance day of year") + ylab("visit duration (h)") +
+  geom_point(alpha = 0.2, aes(col = id)) +
+  theme_classic() + theme(
+    axis.line.x = element_line(colour = 'black', size = 0.5, linetype = 'solid'),
+    axis.line.y = element_line(colour = 'black', size = 0.5, linetype = 'solid'),
+    legend.justification = c(1, 1), legend.position = c(1,1)) +
+  facet_grid(~ site)
+bindoy
+
+# residence time
+
+# calculate approximate residence time by rounding to nearest hour (data is hourly)
+begin = round(wp.stats$time_enter)
+duration = round(wp.stats$timeInside)
+hours = data.frame(site1 = rep(0, 24),
+                   site2 = rep(0, 24),
+                   site3 = rep(0, 24),
+                   site4 = rep(0, 24))
+
+for (i in 1:nrow(wp.stats))
+{
+  #idxs will be 0-23, so add 1 for array indexing
+  idxs = (begin[i] + 0:(duration[i])) %% 24
+  hours[idxs + 1, wp.stats$coordIdx[i]] = hours[idxs + 1, wp.stats$coordIdx[i]] + 1
+}
+
+# reformat data for plotting with reshape2
+hours$hour = factor(row.names(hours), levels = as.character(1:24), ordered = TRUE)
+hours.melt = melt(hours, value.name="Count", variable.name="site", na.rm = TRUE)
+
+restime = ggplot(hours.melt, aes(x = hour, y = Count)) +
+  geom_bar(stat = "identity", color = "darkgray", fill = "gray") +
+  xlab("hour of day") + ylab("total hours") + 
+  scale_x_discrete(breaks = 1:24, 
+                   labels = c("1", "", "", "", "", "6", "", "", "", "", "", "12", "", "", "", "", "", "18", "", "", "", "", "", "24")) +
+  theme_classic()
+restime + facet_grid(~ site) 
+
+# time since last visit
+
+# does time spend vary based on recency of last visit? i.e. less than a day, two days, or longer
+wp.stats$timesince = cut(wp.stats$timeSinceLastVisit, 
+                         breaks = c(0, 24, 48, 2000), labels = c("<24h", "24-48h", ">48h"))
+
+boxtimesince = ggplot(na.omit(wp.stats), aes(x = timesince, y = timeInside, fill = site)) + 
+  geom_boxplot() + ylim(0, 50) + 
+  xlab("time since last visit") + ylab("visit duration (h)") +
+  theme_classic() +
+  theme(legend.justification = c(1, 1), legend.position = c(0.9, 0.9) ) 
+boxtimesince 
 ```
