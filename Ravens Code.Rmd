@@ -134,11 +134,78 @@ ravens_filter_df <- ravens_day_filter_df %>%
               filter(Date %in% boars$Date)
 ```
 
+#### 3. Prepare Polygons
+
+```{r Read in polygon KML files}
+library(here)
+
+# 3) Read the KML file as a Spatial object
+wolf_polygon <- read_sf(here::here("Test polygon.kml"))
+
+# Watch data
+wolf_polygon %>%
+  glimpse()
+
+library(mapview)
+
+plot(wolf_polygon)
+
+# See map
+mapview(wolf_polygon)
+
+# 4) Get the attributes for each observation
+
+# Option a) Using a simple lapply
+attributes <- lapply(X = 1:nrow(moh_chas_clinics), 
+                     FUN = function(x) {
+
+                       moh_chas_clinics %>% 
+                         slice(x) %>%
+                         pull(Description) %>%
+                         read_html() %>%
+                         html_node("table") %>%
+                         html_table(header = TRUE, trim = TRUE, dec = ".", fill = TRUE) %>%
+                         as_tibble(.name_repair = ~ make.names(c("Attribute", "Value"))) %>% 
+                         pivot_wider(names_from = Attribute, values_from = Value)
+
+                     })
+
+# Option b) Using a Parallel lapply (faster)
+future::plan("multisession")
+
+attributes <- future.apply::future_lapply(X = 1:nrow(moh_chas_clinics), 
+                                          FUN = function(x) {
+
+                                            moh_chas_clinics %>% 
+                                              slice(x) %>%
+                                              pull(Description) %>%
+                                              read_html() %>%
+                                              html_node("table") %>%
+                                              html_table(header = TRUE, trim = TRUE, dec = ".", fill = TRUE) %>%
+                                              as_tibble(.name_repair = ~ make.names(c("Attribute", "Value"))) %>% 
+                                              pivot_wider(names_from = Attribute, values_from = Value)
+
+                                          })
+
+# 5) Bind the attributes to each observation as new columns
+moh_chas_clinics_attr <- 
+  moh_chas_clinics %>%
+  bind_cols(bind_rows(attributes)) %>%
+  select(-Description)
+
+# Watch new data
+moh_chas_clinics_attr %>%
+  glimpse()
+
+# New map
+mapview(moh_chas_clinics_attr, 
+        zcol = "CLINIC_PROGRAMME_CODE", 
+        layer.name = "Clinic Programme Code")
+```
+
 #### 3. Intersections
 
 ```{r Calculate intersections with boar and wolf enclosures}
-
-### Intersections and recursions are based on GPS points representing centre points of the enclosures for now; will change these to polygons of the enclosures and/or coordinates of the specific feeding locations.
 
 # Convert raven data into Austria Lambert projection
 range(ravens_filter_df$Longitude)
@@ -154,44 +221,23 @@ presence_sf <- st_as_sf(x = ravens_proj,
                         coords = c("location_long", "location_lat"),
                         crs = "EPSG:3416")
 
-# Read in the coordinates for the feeding enclosures
-park_coords <- read.csv("FI_GPS coordinates.csv") ### Change these to polygons of the enclosures or coordinates of the feeding cages
+# Convert polygons to Austria Lambert projection
+wolf_polygon <- st_transform(wolf_polygon, crs = st_crs("EPSG:3416"))
 
-# Convert enclosure coordinates into Lambert projection
-coordinates(park_coords) <- c("Longitude", "Latitude")
-proj4string(park_coords) <- CRS("+proj=longlat +datum=WGS84")
-park_coords_utm <- spTransform(park_coords, CRS("EPSG:3416"))
-park_coords_utm <- as.data.frame(park_coords_utm)
-head(park_coords_utm)
-
-# Convert enclosure locations (Lambert projection) into an sf object
-park_sf <- st_as_sf(x = park_coords_utm, 
-                    coords = c("coords.x1", "coords.x2"),
-                    crs = "EPSG:3416")
-head(park_sf)
-
-# Get the geometry of location values
-geom_locs = st_geometry(park_sf, CRS("EPSG:3416"))
-head(geom_locs)
+# Get the geometry of the enclosure polygons
+geom_poly = st_geometry(wolf_polygon, CRS("EPSG:3416"))
+head(geom_poly)
 
 # Checking the projections
 projection(presence_sf)
-projection(park_sf)
-projection(geom_locs)
+projection(geom_poly)
 
-# Set buffers
-park_buffer <- st_buffer(geom_locs, dist = 50) # 'dist' is in meters, setting a buffer for 50m
-
-# For each GPS fix, calculate whether or not it intersects with any of the buffers
+# For each GPS fix, calculate whether or not it intersects with either of the enclosures
 # If it does not intersect, in the intersection column, paste " ", else "Enclosure"
 presence_sf <- st_set_crs(presence_sf, "EPSG:3416")
 
-projection(presence_sf)
-projection(park_buffer)
-class(presence_sf$geometry)
-
 intersect_dat <- presence_sf %>% mutate(
-  intersection = as.character(st_intersects(geometry, park_buffer)),
+  intersection = as.character(st_intersects(geometry, geom_poly)),
   intersect = as.numeric(intersection),
   location = if_else(is.na(intersect), "0", paste0("1"))) 
   
@@ -229,8 +275,6 @@ library(viridis)
 
 ```{r Prepare raven data}
 
-### Intersections and recursions are based on GPS points representing centre points of the enclosures for now; will change these to polygons of the enclosures and/or coordinates of the specific feeding locations.
-
 # Make sure that timestamps are in the correct time zone
 head(ravens_filter_df$Timestamps)
 ravens_filter_df$timestamps <- ymd_hms(ravens_filter_df$Timestamps, tz="Europe/Vienna")
@@ -247,8 +291,16 @@ ravens_UTM <- as.data.frame(ravens_UTM)
 ravens_UTM <- ravens_UTM[c(3,4,1,2)]
 head(ravens_UTM)
 
-# Read in location data 
-locs <- read.csv("FI_GPS coordinates.csv") ### Change these to polygons of the enclosures or coordinates of the feeding cages
+# Convert polygons to Austria Lambert projection
+wolf_polygon <- st_transform(wolf_polygon, crs = st_crs("EPSG:3416"))
+
+# Get the geometry of the enclosure polygons
+geom_poly = st_geometry(wolf_polygon, CRS("EPSG:3416"))
+head(geom_poly)
+
+# Checking the projections
+projection(presence_sf)
+projection(geom_poly)
 
 # Convert location data into UTM projection
 locs_coords <- locs %>%
@@ -260,6 +312,9 @@ locs_UTM <- spTransform(locs_coords, CRS("+proj=utm +zone=33 ellps=WGS84"))
 # Convert back to data frame 
 locs_UTM <- as.data.frame(locs_UTM)
 head(locs_UTM)
+
+wolf_poly_df <- as.data.frame(wolf_polygon)
+head(wolf_poly_df)
 
 # save(list = ls(all = T), file = 'recurse.RData')
 ```
@@ -286,16 +341,29 @@ for( i in (1:length(locs_UTM))){
   enclosure_stats[[i]] <- enclosures[[i]]$revisitStats # Creates a df with the revisit stats
 }
 
-# for( i in (1:length(locs_UTM))){
-# enclosures[[i]] <- getRecursionsInPolygon(
-#  ravens_UTM,
-#  polygon,
-#  threshold = 0, # A time difference (in units timeunits) to ignore excursions outside the radius
-#  timeunits = c("hours"),
-#  verbose = TRUE
-# )
-# enclosure_stats[[i]] <- enclosures[[i]]$revisitStats # Creates a df with the revisit stats
-# }
+projection(ravens_UTM)
+projection(wolf_UTM)
+
+wolf_UTM <- st_transform(wolf_polygon, crs = st_crs("+proj=utm +zone=33 ellps=WGS84"))
+
+for( i in (1:length(locs_UTM))){
+ enclosures[[i]] <- getRecursionsInPolygon(
+ ravens_UTM,
+ wolf_polygon,
+ threshold = 0, # A time difference (in units timeunits) to ignore excursions outside the radius
+ timeunits = c("hours"),
+ verbose = TRUE
+ )
+ enclosure_stats[[i]] <- enclosures[[i]]$revisitStats # Creates a df with the revisit stats
+}
+
+recursion_test <- getRecursionsInPolygon(
+ ravens_UTM,
+ wolf_polygon,
+ threshold = 0, # A time difference (in units timeunits) to ignore excursions outside the radius
+ timeunits = c("hours"),
+ verbose = TRUE
+ )
 
 # write.csv(enclosure_stats, "Revisits.csv")
 ```
